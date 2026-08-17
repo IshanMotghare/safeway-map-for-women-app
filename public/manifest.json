@@ -1,0 +1,17 @@
+{
+  "name": "SafeWay Map for Women",
+  "short_name": "SafeWay",
+  "description": "Navigate Safer. Not Just Faster. AI-powered safety-aware routing with real-time incident reporting.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1a73e8",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/google/material-design-icons/master/src/action/security/materialicons/24px.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ]
+}
