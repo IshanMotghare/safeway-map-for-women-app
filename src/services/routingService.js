@@ -1,42 +1,84 @@
-// routingService.js — Free OSRM routing for real Nagpur road geometry
-// Uses router.project-osrm.org (open-source, free, no API key needed)
+// routingService.js — AegisNav Routing (OSRM via AegisNav backend)
 
-const OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving';
+const AEGIS_API_BASE = 'http://localhost:8000/api/v1';
 
 /**
- * Fetch up to 3 alternative routes between two points using OSRM.
- * Returns Leaflet-compatible [lat, lng] coordinate arrays.
- *
- * @param {[number,number]} origin      [lat, lng]
- * @param {[number,number]} destination [lat, lng]
- * @returns {Promise<Array<{coords:[],distance:number,duration:number}>>}
+ * Fetch routes from AegisNav backend.
+ * Returns { routes: [...], zones_avoided: N } or null on failure.
  */
-export async function fetchOSRMRoutes(origin, destination) {
-  // OSRM expects lng,lat order
-  const [oLat, oLng] = origin;
-  const [dLat, dLng] = destination;
-  const url =
-    `${OSRM_BASE}/${oLng},${oLat};${dLng},${dLat}` +
-    `?alternatives=3&geometries=geojson&overview=full&steps=false`;
-
+export async function fetchAegisRoutes(origin, destination) {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
+    const res = await fetch(`${AEGIS_API_BASE}/route`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin, destination }),
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!res.ok) throw new Error(`AegisNav API HTTP ${res.status}`);
     const data = await res.json();
-    if (data.code !== 'Ok' || !data.routes?.length) throw new Error('No routes returned');
 
-    return data.routes.map((route) => ({
-      // OSRM returns [lng, lat], Leaflet needs [lat, lng]
-      coords: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
-      distanceM: route.distance,
-      durationS: route.duration,
-      distanceLabel: formatDistance(route.distance),
-      etaLabel: formatDuration(route.duration),
-    }));
+    const routes = [];
+
+    if (data.fastest_route?.points) {
+      routes.push(formatRoute(data.fastest_route, 'route-fastest', 'Fastest Route'));
+    }
+    if (data.safe_route?.points) {
+      const safe = formatRoute(data.safe_route, 'route-safe', 'Recommended Safe Route');
+      const fastest = routes.find(r => r.id === 'route-fastest');
+      
+      if (fastest) {
+        const distDiff = Math.abs(safe.distanceM - fastest.distanceM) / fastest.distanceM;
+        // If the detour is practically the same route (< 2% diff), deduplicate
+        if (distDiff > 0.02) {
+          routes.push(safe);
+        }
+      } else {
+        routes.push(safe);
+      }
+    }
+
+    if (routes.length === 0) throw new Error('No routes returned by backend');
+
+    return {
+      routes,
+      zones_avoided: data.zones_avoided ?? 0,
+    };
   } catch (err) {
-    console.warn('[OSRM] Routing failed, using seeded fallback:', err.message);
-    return null; // caller falls back to seeded coords
+    console.warn('[AegisNav] Routing failed:', err.message);
+    return null;
   }
+}
+
+/**
+ * Post an incident to the AegisNav backend.
+ */
+export async function postIncident(incident) {
+  try {
+    await fetch(`${AEGIS_API_BASE}/incidents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(incident),
+    });
+  } catch (err) {
+    console.error('[AegisNav] Failed to post incident:', err);
+  }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+function formatRoute(ghRoute, id, label) {
+  // Backend returns GeoJSON coordinates: [lon, lat]
+  // Leaflet wants [lat, lon]
+  const coords = ghRoute.points.coordinates.map(([lon, lat]) => [lat, lon]);
+  return {
+    id,
+    label,
+    coords,
+    distanceM:     ghRoute.distance,
+    durationS:     ghRoute.time / 1000,
+    distanceLabel: formatDistance(ghRoute.distance),
+    etaLabel:      formatDuration(ghRoute.time / 1000),
+  };
 }
 
 function formatDistance(metres) {

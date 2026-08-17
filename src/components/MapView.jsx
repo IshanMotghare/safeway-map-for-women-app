@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import {
   MapContainer, TileLayer, Polyline, Marker,
-  useMap, Circle, Tooltip, ZoomControl,
+  useMap, Circle, Tooltip, ZoomControl
 } from 'react-leaflet';
 import L from 'leaflet';
 import {
@@ -161,8 +161,8 @@ export default function MapView({
   showServices,
   services,
   enhancedMode,
-  layoutKey,       // changes whenever bottom-sheet height changes
-  fitRouteTrigger, // increment to trigger fitBounds
+  layoutKey,
+  fitRouteTrigger,
 }) {
   const hasPanned = useRef(false);
 
@@ -221,6 +221,7 @@ export default function MapView({
         radius={300}
         pathOptions={{ color: '#7c3aed', fillColor: '#7c3aed', fillOpacity: 0.08, weight: 1 }}
       />
+
 
       {/* ── Route polylines */}
       {displayRoutes.map((route) => {

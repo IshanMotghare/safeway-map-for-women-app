@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { MapContainer } from 'react-leaflet';
 import MapView from './components/MapView';
 import RouteCard from './components/RouteCard';
 import ParityCheckPanel from './components/ParityCheckPanel';
@@ -11,7 +10,7 @@ import {
   DESTINATIONS, EMERGENCY_SERVICES, CATEGORY_META, STATUS_LABELS,
 } from './data/seedData';
 import { computeSafetyScore } from './engine/safetyScorer';
-import { fetchOSRMRoutes } from './services/routingService';
+import { fetchAegisRoutes, postIncident } from './services/routingService';
 import './index.css';
 
 // ── Screen IDs ───────────────────────────────────────────────────
@@ -33,161 +32,146 @@ function Toast({ message, type = 'success', onDone }) {
 
 // ── Main App ─────────────────────────────────────────────────────
 export default function App() {
-  // ── Screen state
   const [screen, setScreen] = useState(SCREEN.HOME);
-
-  // ── Safety mode
   const [enhancedMode, setEnhancedMode] = useState(false);
 
-  // ── Route state
-  const [destination, setDestination]   = useState(null);
-  const [selectedRouteId, setSelectedRouteId] = useState('route-b');
-  const [activeRoute, setActiveRoute]   = useState(null);
-  const [routes, setRoutes]             = useState(DEMO_ROUTES);
-  const [loadingRoutes, setLoadingRoutes] = useState(false);
-  const [fitTrigger, setFitTrigger]     = useState(0);
-  const [parityDone, setParityDone]     = useState(false);
+  // Route state
+  const [destination, setDestination]         = useState(null);
+  const [selectedRouteId, setSelectedRouteId] = useState('route-safe');
+  const [activeRoute, setActiveRoute]         = useState(null);
+  const [routes, setRoutes]                   = useState([]);
+  const [loadingRoutes, setLoadingRoutes]     = useState(false);
+  const [fitTrigger, setFitTrigger]           = useState(0);
+  const [parityDone, setParityDone]           = useState(false);
 
-  // ── Incidents
-  const [incidents, setIncidents]       = useState(DEMO_INCIDENTS);
+  // Incidents
+  const [incidents, setIncidents] = useState(DEMO_INCIDENTS);
+  const [liveAlert, setLiveAlert] = useState(null);
 
-  // ── Live location
+  // Live location
   const [userLocation, setUserLocation] = useState(null);
   const watchIdRef = useRef(null);
 
-  // ── Navigation
-  const [liveAlert, setLiveAlert]       = useState(null);
-  const [navEta, setNavEta]             = useState('12 min');
+  // Navigation
+  const [navEta, setNavEta] = useState('12 min');
 
-  // ── Layout
-  const [layoutKey, setLayoutKey]       = useState(0);
-
-  // ── Search
-  const [searchQuery, setSearchQuery]   = useState('');
-
-  // ── Toast
-  const [toast, setToast]               = useState(null);
+  // Layout / search / toast
+  const [layoutKey, setLayoutKey]     = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [toast, setToast]             = useState(null);
 
   const showToast = useCallback((message, type = 'success') => {
     setToast({ message, type });
   }, []);
 
-  // ── Start live GPS watch ─────────────────────────────────────
+  // ── WebSocket — live incident layer ──────────────────────────
+  useEffect(() => {
+    let ws;
+    try {
+      ws = new WebSocket('ws://localhost:8000/ws/alerts');
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'incident') {
+            setIncidents((prev) => [...prev, data]);
+            const msg = data.intent === 'STAY_AWAY'
+              ? `⚠ Hazard reported nearby. Stay alert.`
+              : `🆘 Someone needs help nearby!`;
+            setLiveAlert({ type: data.intent === 'NEED_HELP' ? 'critical' : 'caution', message: msg });
+            setTimeout(() => setLiveAlert(null), 8000);
+          }
+        } catch {}
+      };
+    } catch {}
+    return () => ws?.close();
+  }, []);
+
+  // ── GPS watch ────────────────────────────────────────────────
   useEffect(() => {
     if (!navigator.geolocation) return;
-
-    const options = { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 };
-
     watchIdRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        setUserLocation([pos.coords.latitude, pos.coords.longitude]);
-      },
-      (err) => {
-        console.warn('[GPS]', err.message);
-        // Fallback: use Nagpur center so the demo always works
-        setUserLocation(DEMO_CENTER);
-      },
-      options
+      (pos) => setUserLocation([pos.coords.latitude, pos.coords.longitude]),
+      () => setUserLocation(DEMO_CENTER),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
     );
-
     return () => {
-      if (watchIdRef.current != null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-      }
+      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
     };
   }, []);
 
-  // Invalidate map layout whenever screen changes
-  useEffect(() => {
-    setLayoutKey((k) => k + 1);
-  }, [screen]);
+  // Re-invalidate map on screen change
+  useEffect(() => { setLayoutKey((k) => k + 1); }, [screen]);
 
-  // ── Fetch OSRM routes when destination is selected ──────────
-  const loadOSRMRoutes = useCallback(async (dest) => {
+  // ── Load routes from AegisNav backend ────────────────────────
+  const loadAegisRoutes = useCallback(async (dest, silent = false) => {
     if (!dest) return;
-    setLoadingRoutes(true);
+    if (!silent) setLoadingRoutes(true);
     const origin = userLocation || DEMO_CENTER;
 
-    try {
-      const osrmResults = await fetchOSRMRoutes(origin, dest.coords);
+    const result = await fetchAegisRoutes(origin, dest.coords);
 
-      if (osrmResults && osrmResults.length >= 1) {
-        // Graft OSRM geometry onto our seeded safety characteristics
-        const updated = DEMO_ROUTES.map((seedRoute, i) => {
-          const osrm = osrmResults[Math.min(i, osrmResults.length - 1)];
-          return {
-            ...seedRoute,
-            coords: osrm.coords,
-            distance: osrm.distanceLabel || seedRoute.distance,
-            eta: osrm.etaLabel || seedRoute.eta,
-          };
-        });
-        setRoutes(updated);
-        showToast('✓ Real road routes loaded from OSRM', 'success');
-      } else {
-        setRoutes(DEMO_ROUTES);
+    if (result && result.routes && result.routes.length > 0) {
+      // Map backend routes → UI format, including seeded safety characteristics
+      const seed = { safe: DEMO_ROUTES[1], fastest: DEMO_ROUTES[0] };
+      const fullRoutes = result.routes.map((r) => {
+        const isOnlyRoute = result.routes.length === 1;
+        const isSafe = r.id === 'route-safe' || isOnlyRoute;
+        return {
+          ...r,
+          // Normalise distance / eta field names so RouteCard can read them
+          distance: r.distanceLabel || r.distance || '—',
+          eta:      r.etaLabel      || r.eta      || '—',
+          color:    isSafe ? '#34a853' : '#ef4444',
+          description: isSafe ? 'Recommended best route' : 'Fastest route',
+          safetyLevel: isSafe ? 'safe' : 'caution',
+          characteristics: isSafe ? seed.safe.characteristics : seed.fastest.characteristics,
+          warnings:   isSafe ? seed.safe.warnings   : seed.fastest.warnings,
+          highlights: isSafe ? seed.safe.highlights : seed.fastest.highlights,
+        };
+      });
+      setRoutes(fullRoutes);
+      if (!silent) showToast('✓ Routes loaded — real Nagpur roads', 'success');
+      if (activeRoute) {
+        const refreshed = fullRoutes.find((r) => r.id === activeRoute.id) || fullRoutes[0];
+        setActiveRoute(refreshed);
       }
-    } catch {
+    } else {
+      // Fallback to seeded demo routes
       setRoutes(DEMO_ROUTES);
+      if (!silent) showToast('Using demo routes (backend unavailable)', 'warning');
     }
 
-    setLoadingRoutes(false);
+    if (!silent) setLoadingRoutes(false);
     setFitTrigger((n) => n + 1);
-  }, [userLocation]);
-
-  // ── Live incident simulation during navigation ───────────────
-  useEffect(() => {
-    if (screen !== SCREEN.NAVIGATION) return;
-    const t = setTimeout(() => {
-      const newInc = {
-        id: `inc-live-${Date.now()}`,
-        intent: 'STAY_AWAY',
-        category: 'ACCIDENT',
-        severity: 3,
-        status: 'CORROBORATED',
-        location: [21.1510, 79.0820],
-        description: 'Live: Accident reported ahead on your route.',
-        time: 'Just now',
-        reporterCount: 2,
-        assistanceType: 'NONE',
-        victimsCount: 0,
-        exclusionRadius: 200,
-      };
-      setIncidents((prev) => [...prev, newInc]);
-      setLiveAlert({ type: 'caution', message: '⚠ Accident ahead — Safer detour recommended (+2 min)' });
-      setTimeout(() => setLiveAlert(null), 8000);
-    }, 8000);
-    return () => clearTimeout(t);
-  }, [screen]);
+  }, [userLocation, activeRoute]);
 
   // ── Handlers ─────────────────────────────────────────────────
   const handleDestinationSelect = async (dest) => {
     setDestination(dest);
     setParityDone(false);
-    setSelectedRouteId('route-b');
+    setSelectedRouteId('route-safe');
     setScreen(SCREEN.ROUTE_SELECT);
     setSearchQuery('');
-    await loadOSRMRoutes(dest);
+    await loadAegisRoutes(dest);
   };
 
   const handleStartNavigation = () => {
-    const sel = routes.find((r) => r.id === selectedRouteId) || routes[1];
+    const sel = routes.find((r) => r.id === selectedRouteId) || routes[0];
     setActiveRoute(sel);
     setScreen(SCREEN.NAVIGATION);
     showToast(`✓ Navigation started on ${sel.label}`, 'success');
   };
 
-  const handleIncidentSubmit = (report) => {
-    setIncidents((prev) => [...prev, report]);
+  const handleIncidentSubmit = async (report) => {
+    await postIncident(report);
   };
 
   const goBack = () => {
     if (screen === SCREEN.NAVIGATION) { setActiveRoute(null); setScreen(SCREEN.HOME); }
     else if (screen === SCREEN.ROUTE_SELECT) setScreen(SCREEN.HOME);
     else if (screen === SCREEN.SEARCH) setScreen(SCREEN.HOME);
-    else if (screen === SCREEN.REPORT) setScreen(activeRoute ? SCREEN.NAVIGATION : SCREEN.HOME);
-    else if (screen === SCREEN.EMERGENCY) setScreen(activeRoute ? SCREEN.NAVIGATION : SCREEN.HOME);
-    else if (screen === SCREEN.SERVICES) setScreen(activeRoute ? SCREEN.NAVIGATION : SCREEN.HOME);
+    else if ([SCREEN.REPORT, SCREEN.EMERGENCY, SCREEN.SERVICES].includes(screen))
+      setScreen(activeRoute ? SCREEN.NAVIGATION : SCREEN.HOME);
     else setScreen(SCREEN.HOME);
   };
 
@@ -196,7 +180,7 @@ export default function App() {
     ...r,
     _primaryScore: computeSafetyScore(r.characteristics, enhancedMode).overallScore,
   }));
-  const recommendedRoute = routesWithScores.find((r) => r.id === 'route-b') || routesWithScores[0];
+  const recommendedRoute = routesWithScores.find((r) => r.id === 'route-safe') || routesWithScores[0];
   const selectedRoute    = routesWithScores.find((r) => r.id === selectedRouteId);
 
   const filteredDests = DESTINATIONS.filter(
@@ -205,7 +189,6 @@ export default function App() {
       d.desc.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  // Whether map + its overlays should render
   const showMap = ![SCREEN.REPORT, SCREEN.EMERGENCY, SCREEN.SERVICES, SCREEN.SEARCH].includes(screen);
 
   // ── Render ───────────────────────────────────────────────────
@@ -234,17 +217,14 @@ export default function App() {
       {/* ╔══ HOME ════════════════════════════════════════════╗ */}
       {screen === SCREEN.HOME && (
         <>
-          {/* Top bar */}
           <div className="top-bar">
-            {/* Logo row */}
             <div className="app-logo-row">
               <div className="app-logo">
                 <div className="app-logo-icon">🛡️</div>
                 <div className="app-logo-text">
-                  <div className="app-name">SafeWay Map for Women</div>
-                  <div className="app-tagline">Navigate Safer. Not Just Faster.</div>
+                  <div className="app-name">AegisNav</div>
+                  <div className="app-tagline">Intelligent Safety-First Navigation</div>
                 </div>
-                {/* Live location indicator */}
                 {userLocation && (
                   <div style={{
                     width: 8, height: 8, borderRadius: '50%',
@@ -255,21 +235,18 @@ export default function App() {
               </div>
             </div>
 
-            {/* Safety mode toggle */}
             <div
               className={`safety-mode-chip ${enhancedMode ? 'enhanced' : ''}`}
               onClick={() => {
                 setEnhancedMode(!enhancedMode);
                 showToast(enhancedMode ? 'Standard mode activated' : "🛡 Women's Safety Mode ON", 'warning');
               }}
-              role="button"
-              tabIndex={0}
+              role="button" tabIndex={0}
             >
               <div className="dot" />
               {enhancedMode ? "🛡 Women's Safety Mode" : 'Standard Mode'}
             </div>
 
-            {/* Search bar */}
             <div className="search-bar" onClick={() => setScreen(SCREEN.SEARCH)} role="button" tabIndex={0}>
               <span style={{ fontSize: 18 }}>🔍</span>
               <span className="search-bar-text">Where do you want to go?</span>
@@ -277,14 +254,13 @@ export default function App() {
             </div>
           </div>
 
-          {/* FABs */}
           <div className="fab-group">
             <button className="fab fab-white" title="Nearby Services" onClick={() => setScreen(SCREEN.SERVICES)}>🗺</button>
             <button className="fab fab-report" title="Report Incident" onClick={() => setScreen(SCREEN.REPORT)}>⚠</button>
             <button className="fab fab-sos" onClick={() => setScreen(SCREEN.EMERGENCY)}>SOS</button>
           </div>
 
-          {/* Map legend */}
+          {/* Compact map legend */}
           <div className="map-legend">
             <div className="legend-title">Incident Legend</div>
             <div className="legend-row">
@@ -298,7 +274,7 @@ export default function App() {
               <div className="idot idot--caution idot--sm">
                 <div className="idot__core" />
               </div>
-              <span>Stay Away (Caution)</span>
+              <span>Stay Away (Hazard)</span>
             </div>
           </div>
         </>
@@ -323,8 +299,7 @@ export default function App() {
                 key={dest.name}
                 className="dest-suggestion-item"
                 onClick={() => handleDestinationSelect(dest)}
-                role="button"
-                tabIndex={0}
+                role="button" tabIndex={0}
               >
                 <div className="dest-suggestion-icon">{dest.icon}</div>
                 <div className="dest-suggestion-text">
@@ -341,13 +316,12 @@ export default function App() {
       {/* ╔══ ROUTE SELECTION ═════════════════════════════════╗ */}
       {screen === SCREEN.ROUTE_SELECT && (
         <>
-          {/* Compact top bar */}
           <div className="top-bar">
             <div className="app-logo-row">
               <button className="icon-btn" onClick={goBack}>←</button>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: 'white', textShadow: '0 1px 4px rgba(0,0,0,.4)' }}>
-                  📍 Sitabuldi → {destination?.name || 'Destination'}
+                  📍 Current Location → {destination?.name || 'Destination'}
                 </div>
                 <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.85)', fontWeight: 400 }}>
                   {enhancedMode ? "🛡 Women's Safety Mode" : 'Standard Mode'} · {routes.length} routes analyzed
@@ -365,13 +339,12 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bottom sheet */}
           <div className="bottom-sheet bottom-sheet--open">
             <div className="bottom-sheet-handle" />
             <div className="bottom-sheet-content">
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
                 <div style={{ fontFamily: 'Outfit', fontWeight: 700, fontSize: 15 }}>
-                  {loadingRoutes ? '⟳ Loading real road routes…' : 'Choose Your Route'}
+                  {loadingRoutes ? '⟳ Fetching real routes…' : 'Choose Your Route'}
                 </div>
                 <span className="tag tag-info" style={{ fontSize: 10 }}>
                   {enhancedMode ? '🛡 Enhanced weights' : 'Standard scoring'}
@@ -379,7 +352,7 @@ export default function App() {
               </div>
 
               {/* Parity check */}
-              {!parityDone && recommendedRoute && (
+              {!parityDone && recommendedRoute && routes.length > 0 && (
                 <ParityCheckPanel
                   primaryResult={computeSafetyScore(recommendedRoute.characteristics, enhancedMode)}
                   route={recommendedRoute}
@@ -396,11 +369,11 @@ export default function App() {
                   fontSize: 12, color: '#137333',
                 }}>
                   <span>✓</span>
-                  <span>Safety verification complete — Route B recommended as safest.</span>
+                  <span>Safety verification complete — Safe Route recommended.</span>
                 </div>
               )}
 
-              {/* Route cards sorted by safety score */}
+              {/* Route cards */}
               {routesWithScores
                 .slice()
                 .sort((a, b) => b._primaryScore - a._primaryScore)
@@ -409,7 +382,7 @@ export default function App() {
                     key={route.id}
                     route={route}
                     isSelected={selectedRouteId === route.id}
-                    isRecommended={route.id === 'route-b'}
+                    isRecommended={route.id === 'route-safe'}
                     enhancedMode={enhancedMode}
                     onClick={() => setSelectedRouteId(route.id)}
                   />
@@ -423,13 +396,14 @@ export default function App() {
                   boxShadow: '0 4px 16px rgba(26,115,232,0.40)',
                 }}
                 onClick={handleStartNavigation}
+                disabled={routes.length === 0}
               >
-                🗺 Start Navigation on {selectedRoute?.label || 'Route B'}
+                🗺 Start Navigation on {selectedRoute?.label || 'Safe Route'}
               </button>
 
-              {selectedRouteId !== 'route-b' && (
+              {selectedRouteId !== 'route-safe' && routes.length > 0 && (
                 <p style={{ fontSize: 11, color: 'var(--brand-danger)', textAlign: 'center', marginTop: 6 }}>
-                  ⚠ Route B is safer — are you sure about {selectedRoute?.label}?
+                  ⚠ Safe Route is recommended — are you sure about {selectedRoute?.label}?
                 </p>
               )}
             </div>
@@ -440,35 +414,32 @@ export default function App() {
       {/* ╔══ NAVIGATION ══════════════════════════════════════╗ */}
       {screen === SCREEN.NAVIGATION && (
         <>
-          {/* Alert banner */}
           {liveAlert && (
             <div className={`nav-alert-banner ${liveAlert.type === 'critical' ? 'critical' : ''}`}
               style={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 450 }}>
               <span style={{ fontSize: 18 }}>⚠️</span>
               <span style={{ flex: 1 }}>{liveAlert.message}</span>
               <button onClick={() => setLiveAlert(null)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, opacity: 0.6 }}>
-                ✕
-              </button>
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, opacity: 0.6 }}>✕</button>
             </div>
           )}
 
-          {/* Navigation HUD */}
           <div className="nav-hud">
             <div className="nav-top-card" style={{ marginTop: liveAlert ? 52 : 0 }}>
               <div className="nav-instruction-icon">↗</div>
               <div className="nav-instruction-text">
-                <div className="nav-instruction-main">Continue on Amravati Road</div>
-                <div className="nav-instruction-sub">In 600 m, turn left toward Deekshabhoomi</div>
+                <div className="nav-instruction-main">Continue on Safe Route</div>
+                <div className="nav-instruction-sub">Following AegisNav recommended path</div>
               </div>
               <div className="nav-eta-chip">
-                <div style={{ fontFamily: 'Outfit', fontWeight: 700, fontSize: 18 }}>{navEta}</div>
+                <div style={{ fontFamily: 'Outfit', fontWeight: 700, fontSize: 18 }}>
+                  {activeRoute?.etaLabel || activeRoute?.eta || navEta}
+                </div>
                 <div style={{ fontSize: 9 }}>remaining</div>
               </div>
             </div>
           </div>
 
-          {/* FABs */}
           <div className="fab-group" style={{ bottom: 210 }}>
             <button className="fab fab-white" onClick={goBack} title="Exit navigation">✕</button>
             <button className="fab fab-white" title="Nearby Services" onClick={() => setScreen(SCREEN.SERVICES)}>🗺</button>
@@ -476,7 +447,6 @@ export default function App() {
             <button className="fab fab-sos" onClick={() => setScreen(SCREEN.EMERGENCY)}>SOS</button>
           </div>
 
-          {/* Bottom bar */}
           <div className="bottom-sheet" style={{ transform: 'translateY(calc(100% - 110px))' }}>
             <div className="bottom-sheet-handle" />
             <div className="bottom-sheet-content" style={{ paddingBottom: 8 }}>
@@ -484,7 +454,7 @@ export default function App() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Navigating via</div>
                   <div style={{ fontFamily: 'Outfit', fontWeight: 700, fontSize: 15, color: '#22c55e' }}>
-                    {activeRoute?.label} — {activeRoute?.description}
+                    {activeRoute?.label}
                   </div>
                 </div>
                 <div style={{ textAlign: 'right' }}>
@@ -496,10 +466,10 @@ export default function App() {
               </div>
               <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
                 <div className="nav-stat-chip" style={{ background: '#fef7e0', color: '#b45309' }}>
-                  <span>⚠️ {incidents.filter((i) => i.intent === 'STAY_AWAY').length} Hazards</span>
+                  <span>📍 {activeRoute?.distanceLabel || activeRoute?.distance || '—'}</span>
                 </div>
                 <div className="nav-stat-chip" style={{ background: '#fce8e6', color: '#d93025' }}>
-                  <span>🆘 {incidents.filter((i) => i.intent === 'NEED_HELP').length} Need Help</span>
+                  <span>🆘 {incidents.filter((i) => i.intent === 'NEED_HELP').length} Alerts</span>
                 </div>
                 <div className="nav-stat-chip" style={{ background: '#e6f4ea', color: '#137333' }}>
                   <span>🏥 Services on map</span>
@@ -529,24 +499,16 @@ export default function App() {
 
       {/* ╔══ EMERGENCY / SOS ═════════════════════════════════╗ */}
       {screen === SCREEN.EMERGENCY && (
-        <EmergencyScreen
-          onClose={goBack}
-          onOpenServices={() => setScreen(SCREEN.SERVICES)}
-        />
+        <EmergencyScreen onClose={goBack} onOpenServices={() => setScreen(SCREEN.SERVICES)} />
       )}
 
       {/* ╔══ NEARBY SERVICES ═════════════════════════════════╗ */}
       {screen === SCREEN.SERVICES && (
-        <NearbyServicesScreen
-          onClose={goBack}
-          userLocation={userLocation}
-        />
+        <NearbyServicesScreen onClose={goBack} userLocation={userLocation} />
       )}
 
       {/* ── Toast ───────────────────────────────────────────── */}
-      {toast && (
-        <Toast message={toast.message} type={toast.type} onDone={() => setToast(null)} />
-      )}
+      {toast && <Toast message={toast.message} type={toast.type} onDone={() => setToast(null)} />}
     </div>
   );
 }
